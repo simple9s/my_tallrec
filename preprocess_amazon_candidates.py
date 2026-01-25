@@ -15,6 +15,48 @@ def load_amazon_data(file_path):
     return pd.DataFrame(data)
 
 
+def filter_k_core(user_dict, item_counts, k=5):
+    """Filter k-core: users and items with at least k interactions"""
+    while True:
+        # Filter users
+        new_user_dict = {}
+        for user, interactions in user_dict.items():
+            if len(interactions['asin']) >= k:
+                new_user_dict[user] = interactions
+
+        # Filter items
+        new_item_counts = defaultdict(int)
+        for user, interactions in new_user_dict.items():
+            valid_items = []
+            valid_ratings = []
+            valid_times = []
+            valid_titles = []
+            for i, item in enumerate(interactions['asin']):
+                if item_counts[item] >= k:
+                    valid_items.append(item)
+                    valid_ratings.append(interactions['rating'][i])
+                    valid_times.append(interactions['time'][i])
+                    valid_titles.append(interactions['title'][i])
+                    new_item_counts[item] += 1
+
+            if len(valid_items) >= k:
+                new_user_dict[user] = {
+                    'asin': valid_items,
+                    'rating': valid_ratings,
+                    'time': valid_times,
+                    'title': valid_titles
+                }
+
+        # Check convergence
+        if len(new_user_dict) == len(user_dict):
+            break
+
+        user_dict = new_user_dict
+        item_counts = new_item_counts
+
+    return user_dict
+
+
 def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
     """
     Preprocess Amazon data with candidate sets
@@ -29,6 +71,11 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
     reviews = load_amazon_data(review_file)
     metadata = load_amazon_data(meta_file)
 
+    # Filter by rating for luxury_beauty with neg_ratio=19
+    if category == 'Luxury_Beauty' and neg_ratio == 19:
+        print("Filtering luxury_beauty: overall >= 3")
+        reviews = reviews[reviews['overall'] >= 3]
+
     # Create item mapping
     item_to_idx = {asin: idx for idx, asin in enumerate(metadata['asin'].unique())}
     all_items = set(item_to_idx.keys())
@@ -41,10 +88,9 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         else:
             item_titles[row['asin']] = row['asin']
 
-    metadata[['asin', 'title']].to_csv(f'{category.lower()}_item_mapping.csv', index=False)
-
     # Build user interaction dict
     user_dict = defaultdict(lambda: {'asin': [], 'rating': [], 'time': [], 'title': []})
+    item_counts = defaultdict(int)
 
     for _, row in tqdm(reviews.iterrows(), desc="Processing reviews", total=len(reviews)):
         if row['asin'] not in item_to_idx:
@@ -54,9 +100,29 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         user_dict[user_id]['rating'].append(int(row['overall'] > 3))
         user_dict[user_id]['time'].append(row['unixReviewTime'])
         user_dict[user_id]['title'].append(item_titles.get(row['asin'], row['asin']))
+        item_counts[row['asin']] += 1
 
-    # Filter users with more than 3 interactions
-    filtered_users = {k: v for k, v in user_dict.items() if len(v['asin']) > 3}
+    # Apply filtering based on neg_ratio
+    if neg_ratio == 19:
+        # For 1:19
+        if category == 'Luxury_Beauty':
+            min_interactions = 4
+        else:
+            min_interactions = 5
+
+        print(f"Filtering users with at least {min_interactions} interactions...")
+        filtered_users = {k: v for k, v in user_dict.items() if len(v['asin']) >= min_interactions}
+    else:
+        # For 1:99, apply 5-core filtering
+        print("Applying 5-core filtering...")
+        filtered_users = filter_k_core(dict(user_dict), item_counts, k=5)
+
+    # Update all_items based on filtered data
+    all_items = set()
+    for user_data in filtered_users.values():
+        all_items.update(user_data['asin'])
+
+    metadata[['asin', 'title']].to_csv(f'{category.lower()}_item_mapping.csv', index=False)
 
     # Sort by timestamp
     sequential_data = []
@@ -68,7 +134,7 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         sorted_rating = [interactions['rating'][i] for i in indices]
         sorted_title = [interactions['title'][i] for i in indices]
 
-        for i in range(seq_len, len(sorted_asin)):
+        for i in range(min(seq_len, len(sorted_asin) - 1), len(sorted_asin)):
             user_history = set(sorted_asin[:i + 1])
             neg_candidates = list(all_items - user_history)
 
@@ -132,6 +198,8 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         with open(output_path, 'w') as f:
             json.dump(json_list, f, indent=4)
 
+        print(f"Generated {len(json_list)} samples to {output_path}")
+
     # Generate datasets
     create_json_with_candidates(train_data, f'./data/train_{category.lower()}_{neg_ratio + 1}.json', neg_ratio)
     create_json_with_candidates(valid_data, f'./data/valid_{category.lower()}_{neg_ratio + 1}.json', neg_ratio)
@@ -152,9 +220,3 @@ if __name__ == "__main__":
         print(f"Processing Software with 1:{neg_ratio} ratio")
         print(f"{'=' * 50}")
         preprocess_amazon_with_candidates('Software', neg_ratio)
-
-    for neg_ratio in [19, 99]:
-        print(f"\n{'=' * 50}")
-        print(f"Processing Software with 1:{neg_ratio} ratio")
-        print(f"{'=' * 50}")
-        preprocess_amazon_with_candidates('Video_Games', neg_ratio)
