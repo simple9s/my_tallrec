@@ -152,3 +152,9 @@ if __name__ == "__main__":
         print(f"Processing Software with 1:{neg_ratio} ratio")
         print(f"{'=' * 50}")
         preprocess_amazon_with_candidates('Software', neg_ratio)
+
+    for neg_ratio in [19, 99]:
+        print(f"\n{'=' * 50}")
+        print(f"Processing Software with 1:{neg_ratio} ratio")
+        print(f"{'=' * 50}")
+        preprocess_amazon_with_candidates('Video_Games', neg_ratio)
