@@ -1,7 +1,8 @@
 import sys
 import fire
 import torch
-
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 torch.set_num_threads(1)
 import json
 import os
@@ -9,7 +10,6 @@ import os
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['OMP_NUM_THREADS'] = '1'
 from peft import PeftModel
-from transformers import GenerationConfig
 from model_utils import load_model_and_tokenizer
 from tqdm import tqdm
 import numpy as np
@@ -26,27 +26,17 @@ except:
     pass
 
 
-def calculate_metrics(predictions, targets, candidates_list, k_list=[1, 5, 10, 20]):
-    """
-    Calculate Hit@k and NDCG@k
-    predictions: list of predicted item indices
-    targets: list of ground truth indices
-    candidates_list: list of candidate lists
-    """
+def calculate_metrics(ranked_positions, k_list=[1, 5, 10, 20]):
     metrics = {}
     for k in k_list:
         hits = []
         ndcgs = []
-        for pred_idx, target_idx, candidates in zip(predictions, targets, candidates_list):
-            if len(candidates) < k:
-                continue
-            # Hit@k
-            hit = 1.0 if target_idx < k else 0.0
+        for pos in ranked_positions:
+            hit = 1.0 if pos < k else 0.0
             hits.append(hit)
 
-            # NDCG@k
-            if target_idx < k:
-                ndcg = 1.0 / np.log2(target_idx + 2)
+            if pos < k:
+                ndcg = 1.0 / np.log2(pos + 2)
             else:
                 ndcg = 0.0
             ndcgs.append(ndcg)
@@ -63,13 +53,11 @@ def main(
         lora_weights: str = "",
         test_data_path: str = "data/test_20.json",
         result_json_data: str = "results.json",
-        batch_size: int = 8,
 ):
     assert base_model, "Please specify a --base_model"
 
     model_type = lora_weights.split('/')[-1]
 
-    # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(base_model, load_in_8bit=load_8bit, device_map="auto")
 
     if device == "cuda":
@@ -88,96 +76,131 @@ def main(
         )
 
     model.config.pad_token_id = tokenizer.pad_token_id = 0
-    model.config.bos_token_id = 1
-    model.config.eos_token_id = 2
-
     if not load_8bit:
         model.half()
-
     model.eval()
+
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
-    def evaluate(
-            instructions,
-            inputs=None,
-            temperature=0.1,
-            top_p=0.9,
-            top_k=40,
-            num_beams=1,
-            max_new_tokens=64,
-            **kwargs,
-    ):
-        prompts = [generate_prompt(instruction, inp) for instruction, inp in zip(instructions, inputs)]
-        inputs_tensor = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-        generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams,
-            **kwargs,
-        )
-        with torch.no_grad():
-            generation_output = model.generate(
-                **inputs_tensor,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=True,
-                max_new_tokens=max_new_tokens,
-            )
-        s = generation_output.sequences
-        output = tokenizer.batch_decode(s, skip_special_tokens=True)
-        output = [_.split('Response:\n')[-1].strip() for _ in output]
-        return output
+    def score_candidate(prompt_text, candidate_text):
+        """Calculate average log-likelihood of candidate tokens given prompt"""
+        # Tokenize prompt and full text separately
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
+        candidate_ids = tokenizer.encode(candidate_text, add_special_tokens=False)
 
-    # Load test data
+        # Create full sequence
+        full_ids = prompt_ids + candidate_ids
+        full_tensor = torch.tensor([full_ids]).to(device)
+
+        with torch.no_grad():
+            outputs = model(input_ids=full_tensor)
+            logits = outputs.logits
+
+        # Calculate log probability for candidate tokens only
+        log_probs = []
+        prompt_len = len(prompt_ids)
+
+        for i in range(prompt_len - 1, min(len(full_ids) - 1, logits.shape[1] - 1)):
+            if i - prompt_len + 1 < len(candidate_ids):
+                token_logits = logits[0, i]
+                next_token_id = full_ids[i + 1]
+                log_prob = torch.log_softmax(token_logits, dim=-1)[next_token_id].item()
+                log_probs.append(log_prob)
+
+        # Return average log probability (higher is better)
+        return np.mean(log_probs) if log_probs else -1e10
+
+    def generate_response(prompt_text):
+        """Generate actual model response"""
+        inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=512).to(device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                temperature=0.1,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if 'Response:' in response:
+            return response.split('Response:')[-1].strip()
+        return response.strip()
+
     with open(test_data_path, 'r') as f:
         test_data = json.load(f)
 
-    instructions = [_['instruction'] for _ in test_data]
-    inputs = [_['input'] for _ in test_data]
-    candidates_list = [_['candidates'] for _ in test_data]
-    target_indices = [_['target_index'] for _ in test_data]
+    print(f"Evaluating {len(test_data)} samples...")
+    ranked_positions = []
+    debug_results = []
+    debug_file = result_json_data.replace('.json', '_debug.json')
+    with open(debug_file, 'w') as f:
+        f.write('[\n')
+    for idx, item in enumerate(tqdm(test_data, desc="Evaluating")):
+        instruction = item['instruction']
+        input_text = item['input']
+        candidates = item['candidates']
+        target_index = item['target_index']
 
-    # Batch evaluation
-    predictions = []
+        prompt = generate_prompt(instruction, input_text)
 
-    def batch_data(lst, batch_size=8):
-        for i in range(0, len(lst), batch_size):
-            yield lst[i:i + batch_size]
+        # Generate actual response
+        generated_text = generate_response(prompt)
 
-    print("Evaluating...")
-    for inst_batch, inp_batch, cand_batch in tqdm(zip(
-            batch_data(instructions, batch_size),
-            batch_data(inputs, batch_size),
-            batch_data(candidates_list, batch_size)
-    ), total=(len(instructions) + batch_size - 1) // batch_size):
+        # Score all candidates
+        scores = []
+        for cand in candidates:
+            score = score_candidate(prompt, cand)
+            scores.append(score)
 
-        outputs = evaluate(inst_batch, inp_batch)
+        # Rank by score (descending)
+        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
 
-        # Find predicted indices
-        for output, candidates in zip(outputs, cand_batch):
-            output_clean = output.strip().strip('"').strip("'")
-            try:
-                pred_idx = next((i for i, c in enumerate(candidates)
-                                 if c.lower() in output_clean.lower() or
-                                 output_clean.lower() in c.lower()), len(candidates))
-            except:
-                pred_idx = len(candidates)
-            predictions.append(pred_idx)
+        # Find target position
+        target_position = ranked_indices.index(target_index)
+        ranked_positions.append(target_position)
 
-    # Calculate metrics
-    metrics = calculate_metrics(predictions, target_indices, candidates_list)
+        # Save debug info
+        debug_results.append({
+            'sample_id': idx,
+            'generated_text': generated_text,
+            'target': candidates[target_index],
+            'target_score': scores[target_index],
+            'target_rank': target_position + 1,
+            'top_5_predictions': [
+                {
+                    'rank': i + 1,
+                    'candidate': candidates[ranked_indices[i]],
+                    'score': scores[ranked_indices[i]]
+                } for i in range(min(5, len(ranked_indices)))
+            ]
+        })
+        with open(debug_file, 'a') as f:
+            json.dump(debug_results[-1], f, indent=2)
+            f.write(',\n' if idx < len(test_data) - 1 else '\n]')
+        # Print first 3 samples
+        if idx < 3:
+            print(f"\n{'=' * 60}")
+            print(f"Sample {idx + 1}:")
+            print(f"Generated: {generated_text[:100]}...")
+            print(f"Target: {candidates[target_index][:60]}...")
+            print(f"Target score: {scores[target_index]:.4f}")
+            print(f"Target rank: {target_position + 1}/{len(candidates)}")
+            print(f"Top 3:")
+            for i in range(min(3, len(ranked_indices))):
+                ridx = ranked_indices[i]
+                print(f"  {i + 1}. score={scores[ridx]:.4f}: {candidates[ridx][:50]}...")
 
-    # Save results
+
+    print(f"\nDebug results saved to: {debug_file}")
+
+    metrics = calculate_metrics(ranked_positions)
+
     if os.path.exists(result_json_data):
         with open(result_json_data, 'r') as f:
             data = json.load(f)
     else:
         data = {}
-
-    if model_type not in data:
-        data[model_type] = {}
 
     data[model_type] = metrics
 
