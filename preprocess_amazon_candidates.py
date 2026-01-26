@@ -4,6 +4,8 @@ import random
 import gzip
 from collections import defaultdict
 from tqdm import tqdm
+from datetime import datetime
+import os
 
 
 def load_amazon_data(file_path):
@@ -18,13 +20,11 @@ def load_amazon_data(file_path):
 def filter_k_core(user_dict, item_counts, k=5):
     """Filter k-core: users and items with at least k interactions"""
     while True:
-        # Filter users
         new_user_dict = {}
         for user, interactions in user_dict.items():
             if len(interactions['asin']) >= k:
                 new_user_dict[user] = interactions
 
-        # Filter items
         new_item_counts = defaultdict(int)
         for user, interactions in new_user_dict.items():
             valid_items = []
@@ -47,7 +47,6 @@ def filter_k_core(user_dict, item_counts, k=5):
                     'title': valid_titles
                 }
 
-        # Check convergence
         if len(new_user_dict) == len(user_dict):
             break
 
@@ -58,12 +57,6 @@ def filter_k_core(user_dict, item_counts, k=5):
 
 
 def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
-    """
-    Preprocess Amazon data with candidate sets
-    category: 'Luxury_Beauty' or 'Software'
-    neg_ratio: 19 for 1:19, 99 for 1:99
-    """
-    # Load data
     print(f"Loading {category} data...")
     review_file = f'{category}.json.gz'
     meta_file = f'meta_{category}.json.gz'
@@ -71,16 +64,13 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
     reviews = load_amazon_data(review_file)
     metadata = load_amazon_data(meta_file)
 
-    # Filter by rating for luxury_beauty with neg_ratio=19
     if category == 'Luxury_Beauty' and neg_ratio == 19:
         print("Filtering luxury_beauty: overall >= 3")
         reviews = reviews[reviews['overall'] >= 3]
 
-    # Create item mapping
     item_to_idx = {asin: idx for idx, asin in enumerate(metadata['asin'].unique())}
     all_items = set(item_to_idx.keys())
 
-    # Get item titles
     item_titles = {}
     for _, row in metadata.iterrows():
         if 'title' in row and pd.notna(row['title']):
@@ -88,7 +78,6 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         else:
             item_titles[row['asin']] = row['asin']
 
-    # Build user interaction dict
     user_dict = defaultdict(lambda: {'asin': [], 'rating': [], 'time': [], 'title': []})
     item_counts = defaultdict(int)
 
@@ -102,29 +91,23 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         user_dict[user_id]['title'].append(item_titles.get(row['asin'], row['asin']))
         item_counts[row['asin']] += 1
 
-    # Apply filtering based on neg_ratio
     if neg_ratio == 19:
-        # For 1:19
         if category == 'Luxury_Beauty':
             min_interactions = 4
         else:
             min_interactions = 5
-
         print(f"Filtering users with at least {min_interactions} interactions...")
         filtered_users = {k: v for k, v in user_dict.items() if len(v['asin']) >= min_interactions}
     else:
-        # For 1:99, apply 5-core filtering
         print("Applying 5-core filtering...")
         filtered_users = filter_k_core(dict(user_dict), item_counts, k=5)
 
-    # Update all_items based on filtered data
     all_items = set()
     for user_data in filtered_users.values():
         all_items.update(user_data['asin'])
 
     metadata[['asin', 'title']].to_csv(f'{category.lower()}_item_mapping.csv', index=False)
 
-    # Sort by timestamp
     sequential_data = []
     seq_len = 10
 
@@ -133,6 +116,7 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
         sorted_asin = [interactions['asin'][i] for i in indices]
         sorted_rating = [interactions['rating'][i] for i in indices]
         sorted_title = [interactions['title'][i] for i in indices]
+        sorted_time = [interactions['time'][i] for i in indices]
 
         for i in range(min(seq_len, len(sorted_asin) - 1), len(sorted_asin)):
             user_history = set(sorted_asin[:i + 1])
@@ -143,13 +127,13 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
                 'history_asin': sorted_asin[max(0, i - seq_len):i],
                 'history_rating': sorted_rating[max(0, i - seq_len):i],
                 'history_title': sorted_title[max(0, i - seq_len):i],
+                'history_time': sorted_time[max(0, i - seq_len):i],
                 'target_asin': sorted_asin[i],
                 'target_rating': sorted_rating[i],
                 'target_title': sorted_title[i],
                 'neg_candidates': neg_candidates
             })
 
-    # Split data
     random.shuffle(sequential_data)
     train_size = int(len(sequential_data) * 0.8)
     valid_size = int(len(sequential_data) * 0.9)
@@ -161,35 +145,29 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
     def create_json_with_candidates(data_list, output_path, neg_ratio):
         json_list = []
         for item in tqdm(data_list, desc=f"Generating {output_path}"):
-            # Only use positive targets
             if item['target_rating'] != 1:
                 continue
 
-            # Build preference strings
-            preference = [f'"{title}"' for title, rating in
-                          zip(item['history_title'], item['history_rating']) if rating == 1]
-            unpreference = [f'"{title}"' for title, rating in
-                            zip(item['history_title'], item['history_rating']) if rating == 0]
+            history_items = []
+            for idx, (title, timestamp) in enumerate(zip(item['history_title'], item['history_time'])):
+                date_str = datetime.fromtimestamp(timestamp).strftime('%Y/%m/%d')
+                history_items.append(f"No.{idx + 1} Time: {date_str} Title: {title}")
 
-            # Sample negative candidates
+            history_str = ", ".join(history_items) if history_items else "None"
+
             random.shuffle(item['neg_candidates'])
             neg_samples = item['neg_candidates'][:neg_ratio]
 
-            # Create candidate list
             candidates_asin = [item['target_asin']] + neg_samples
             random.shuffle(candidates_asin)
             target_index = candidates_asin.index(item['target_asin'])
 
-            # Get candidate titles
-            candidate_titles = [f'"{item_titles.get(asin, asin)}"' for asin in candidates_asin]
-
-            preference_str = ", ".join(preference) if preference else "None"
-            unpreference_str = ", ".join(unpreference) if unpreference else "None"
-            candidates_str = ", ".join(candidate_titles)
+            candidate_titles = [item_titles.get(asin, asin) for asin in candidates_asin]
 
             json_list.append({
-                "instruction": f"Given the user's preference and unpreference, select the product the user will most likely enjoy from the following {neg_ratio + 1} candidates. Answer with the product title only.",
-                "input": f"User Preference: {preference_str}\nUser Unpreference: {unpreference_str}\nCandidates: {candidates_str}\nWhich product will the user most likely enjoy?",
+                "instruction": f"This user has made a series of purchases in the following order: [{history_str}]. Based on this sequence of purchases, generate user representation token: [UserRep].",
+                "input": f"Given the {neg_ratio + 1} candidate items below, select which item the user will most likely purchase next:\n" + "\n".join(
+                    [f'{i + 1}. Title: {title}' for i, title in enumerate(candidate_titles)]),
                 "output": candidate_titles[target_index],
                 "candidates": candidate_titles,
                 "target_index": target_index
@@ -200,23 +178,70 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
 
         print(f"Generated {len(json_list)} samples to {output_path}")
 
-    # Generate datasets
     create_json_with_candidates(train_data, f'./data/train_{category.lower()}_{neg_ratio + 1}.json', neg_ratio)
     create_json_with_candidates(valid_data, f'./data/valid_{category.lower()}_{neg_ratio + 1}.json', neg_ratio)
     create_json_with_candidates(test_data, f'./data/test_{category.lower()}_{neg_ratio + 1}.json', neg_ratio)
 
 
 if __name__ == "__main__":
-    # Process Luxury Beauty
-    for neg_ratio in [19, 99]:
-        print(f"\n{'=' * 50}")
-        print(f"Processing Luxury_Beauty with 1:{neg_ratio} ratio")
-        print(f"{'=' * 50}")
-        preprocess_amazon_with_candidates('Luxury_Beauty', neg_ratio)
+    os.makedirs('./data', exist_ok=True)
+    import multiprocessing
+    from functools import partial
 
-    # Process Software
-    for neg_ratio in [19, 99]:
+
+    def process_dataset(args):
+        """每个进程执行的任务函数"""
+        dataset_name, neg_ratio = args
         print(f"\n{'=' * 50}")
-        print(f"Processing Software with 1:{neg_ratio} ratio")
+        print(f"Processing {dataset_name} with 1:{neg_ratio} ratio")
         print(f"{'=' * 50}")
-        preprocess_amazon_with_candidates('Software', neg_ratio)
+
+        # 调用你的预处理函数
+        preprocess_amazon_with_candidates(dataset_name, neg_ratio)
+
+        print(f"Completed {dataset_name} with 1:{neg_ratio} ratio")
+        return f"{dataset_name}_{neg_ratio}"
+
+
+    def main():
+        # 定义所有要处理的任务组合
+        datasets = ['Luxury_Beauty', 'Software', 'Video_Games']
+        neg_ratios = [19, 99]
+
+        # 创建所有任务参数组合
+        tasks = [(dataset, ratio) for dataset in datasets for ratio in neg_ratios]
+
+        print(f"开始处理 {len(tasks)} 个任务")
+        print(f"可用CPU核心数: {multiprocessing.cpu_count()}")
+
+        # 设置进程池大小（通常为CPU核心数或稍少）
+        # 对于I/O密集型任务，可以设置稍多一些
+        pool_size = min(multiprocessing.cpu_count(), len(tasks))
+
+        # 使用进程池并行执行
+        with multiprocessing.Pool(processes=pool_size) as pool:
+            results = pool.map(process_dataset, tasks)
+
+        print(f"\n所有任务完成: {results}")
+
+
+    # # Process Luxury Beauty
+    # for neg_ratio in [19, 99]:
+    #     print(f"\n{'='*50}")
+    #     print(f"Processing Luxury_Beauty with 1:{neg_ratio} ratio")
+    #     print(f"{'='*50}")
+    #     preprocess_amazon_with_candidates('Luxury_Beauty', neg_ratio)
+
+    # # Process Software
+    # for neg_ratio in [19, 99]:
+    #     print(f"\n{'='*50}")
+    #     print(f"Processing Software with 1:{neg_ratio} ratio")
+    #     print(f"{'='*50}")
+    #     preprocess_amazon_with_candidates('Software', neg_ratio)
+
+    # for neg_ratio in [19, 99]:
+    #     print(f"\n{'='*50}")
+    #     print(f"Processing Software with 1:{neg_ratio} ratio")
+    #     print(f"{'='*50}")
+    #     preprocess_amazon_with_candidates('Video_Games', neg_ratio)
+    main()

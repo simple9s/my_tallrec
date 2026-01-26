@@ -60,6 +60,11 @@ def main(
 
     model, tokenizer = load_model_and_tokenizer(base_model, load_in_8bit=load_8bit, device_map="auto")
 
+    # Add special tokens
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    tokenizer.add_special_tokens({'additional_special_tokens': ['[UserRep]', '[HistoryEmb]', '[CandidateEmb]']})
+    model.resize_token_embeddings(len(tokenizer))
+
     if device == "cuda":
         model = PeftModel.from_pretrained(
             model,

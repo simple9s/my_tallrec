@@ -58,6 +58,11 @@ def train(
 
     model, tokenizer = load_model_and_tokenizer(base_model, load_in_8bit=True, device_map=device_map)
 
+    # Add special tokens
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    tokenizer.add_special_tokens({'additional_special_tokens': ['[UserRep]', '[HistoryEmb]', '[CandidateEmb]']})
+    model.resize_token_embeddings(len(tokenizer))
+
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
             prompt,
@@ -167,16 +172,13 @@ def train(
     )
     model.config.use_cache = False
 
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
-    ).__get__(model, type(model))
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     print("\nIf there's a warning about missing keys above, please disregard :)")
 
 
