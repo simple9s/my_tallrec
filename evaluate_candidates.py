@@ -2,6 +2,7 @@ import sys
 import fire
 import torch
 import torch._dynamo
+
 torch._dynamo.config.suppress_errors = True
 torch.set_num_threads(1)
 import json
@@ -53,6 +54,7 @@ def main(
         lora_weights: str = "",
         test_data_path: str = "data/test_20.json",
         result_json_data: str = "results.json",
+        batch_size: int = 8,
 ):
     assert base_model, "Please specify a --base_model"
 
@@ -88,114 +90,123 @@ def main(
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
-    def score_candidate(prompt_text, candidate_text):
-        """Calculate average log-likelihood of candidate tokens given prompt"""
-        # Tokenize prompt and full text separately
-        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
-        candidate_ids = tokenizer.encode(candidate_text, add_special_tokens=False)
+    def score_candidates_batch(prompts, candidates_list):
+        """Batch scoring of candidates for multiple samples"""
+        all_scores = []
 
-        # Create full sequence
-        full_ids = prompt_ids + candidate_ids
-        full_tensor = torch.tensor([full_ids]).to(device)
+        for prompt, candidates in zip(prompts, candidates_list):
+            scores = []
+            # Process candidates in batches
+            for i in range(0, len(candidates), batch_size):
+                batch_candidates = candidates[i:i + batch_size]
+                batch_texts = [prompt + cand for cand in batch_candidates]
 
-        with torch.no_grad():
-            outputs = model(input_ids=full_tensor)
-            logits = outputs.logits
+                inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(
+                    device)
 
-        # Calculate log probability for candidate tokens only
-        log_probs = []
-        prompt_len = len(prompt_ids)
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                    logits = outputs.logits
 
-        for i in range(prompt_len - 1, min(len(full_ids) - 1, logits.shape[1] - 1)):
-            if i - prompt_len + 1 < len(candidate_ids):
-                token_logits = logits[0, i]
-                next_token_id = full_ids[i + 1]
-                log_prob = torch.log_softmax(token_logits, dim=-1)[next_token_id].item()
-                log_probs.append(log_prob)
+                    # Calculate average log probability for each candidate
+                    for j, text in enumerate(batch_texts):
+                        text_ids = tokenizer.encode(text, add_special_tokens=True)
+                        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+                        candidate_len = len(text_ids) - len(prompt_ids)
 
-        # Return average log probability (higher is better)
-        return np.mean(log_probs) if log_probs else -1e10
+                        if candidate_len <= 0:
+                            scores.append(-1e10)
+                            continue
 
-    def generate_response(prompt_text):
-        """Generate actual model response"""
-        inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=512).to(device)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=64,
-                temperature=0.1,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        if 'Response:' in response:
-            return response.split('Response:')[-1].strip()
-        return response.strip()
+                        # Get log probs for candidate tokens
+                        log_probs = []
+                        start_idx = len(prompt_ids) - 1
+                        for k in range(start_idx, min(start_idx + candidate_len, logits.shape[1] - 1)):
+                            if k - start_idx + len(prompt_ids) < len(text_ids):
+                                token_logits = logits[j, k]
+                                next_token_id = text_ids[k - start_idx + len(prompt_ids)]
+                                log_prob = torch.log_softmax(token_logits, dim=-1)[next_token_id].item()
+                                log_probs.append(log_prob)
+
+                        scores.append(np.mean(log_probs) if log_probs else -1e10)
+
+            all_scores.append(scores)
+
+        return all_scores
 
     with open(test_data_path, 'r') as f:
         test_data = json.load(f)
 
-    print(f"Evaluating {len(test_data)} samples...")
+    print(f"Evaluating {len(test_data)} samples with batch_size={batch_size}...")
     ranked_positions = []
     debug_results = []
     debug_file = result_json_data.replace('.json', '_debug.json')
+
+    # Process in batches
+    def batch_data(data, batch_size):
+        for i in range(0, len(data), batch_size):
+            yield data[i:i + batch_size]
+
     with open(debug_file, 'w') as f:
         f.write('[\n')
-    for idx, item in enumerate(tqdm(test_data, desc="Evaluating")):
-        instruction = item['instruction']
-        input_text = item['input']
-        candidates = item['candidates']
-        target_index = item['target_index']
 
-        prompt = generate_prompt(instruction, input_text)
+    sample_idx = 0
+    for batch_items in tqdm(batch_data(test_data, batch_size), desc="Evaluating",
+                            total=(len(test_data) + batch_size - 1) // batch_size):
+        prompts = []
+        candidates_list = []
+        target_indices = []
 
-        # Generate actual response
-        generated_text = generate_response(prompt)
+        for item in batch_items:
+            instruction = item['instruction']
+            input_text = item['input']
+            candidates = item['candidates']
+            target_index = item['target_index']
 
-        # Score all candidates
-        scores = []
-        for cand in candidates:
-            score = score_candidate(prompt, cand)
-            scores.append(score)
+            prompt = generate_prompt(instruction, input_text)
+            prompts.append(prompt)
+            candidates_list.append(candidates)
+            target_indices.append(target_index)
 
-        # Rank by score (descending)
-        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        # Score all candidates in batch
+        batch_scores = score_candidates_batch(prompts, candidates_list)
 
-        # Find target position
-        target_position = ranked_indices.index(target_index)
-        ranked_positions.append(target_position)
+        # Process results
+        for i, (scores, target_index, candidates) in enumerate(zip(batch_scores, target_indices, candidates_list)):
+            ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            target_position = ranked_indices.index(target_index)
+            ranked_positions.append(target_position)
 
-        # Save debug info
-        debug_results.append({
-            'sample_id': idx,
-            'generated_text': generated_text,
-            'target': candidates[target_index],
-            'target_score': scores[target_index],
-            'target_rank': target_position + 1,
-            'top_5_predictions': [
-                {
-                    'rank': i + 1,
-                    'candidate': candidates[ranked_indices[i]],
-                    'score': scores[ranked_indices[i]]
-                } for i in range(min(5, len(ranked_indices)))
-            ]
-        })
-        with open(debug_file, 'a') as f:
-            json.dump(debug_results[-1], f, indent=2)
-            f.write(',\n' if idx < len(test_data) - 1 else '\n]')
-        # Print first 3 samples
-        if idx < 3:
-            print(f"\n{'=' * 60}")
-            print(f"Sample {idx + 1}:")
-            print(f"Generated: {generated_text[:100]}...")
-            print(f"Target: {candidates[target_index][:60]}...")
-            print(f"Target score: {scores[target_index]:.4f}")
-            print(f"Target rank: {target_position + 1}/{len(candidates)}")
-            print(f"Top 3:")
-            for i in range(min(3, len(ranked_indices))):
-                ridx = ranked_indices[i]
-                print(f"  {i + 1}. score={scores[ridx]:.4f}: {candidates[ridx][:50]}...")
+            debug_results.append({
+                'sample_id': sample_idx,
+                'target': candidates[target_index],
+                'target_score': scores[target_index],
+                'target_rank': target_position + 1,
+                'top_5_predictions': [
+                    {
+                        'rank': j + 1,
+                        'candidate': candidates[ranked_indices[j]],
+                        'score': scores[ranked_indices[j]]
+                    } for j in range(min(5, len(ranked_indices)))
+                ]
+            })
 
+            with open(debug_file, 'a') as f:
+                json.dump(debug_results[-1], f, indent=2)
+                f.write(',\n' if sample_idx < len(test_data) - 1 else '\n]')
+
+            if sample_idx < 3:
+                print(f"\n{'=' * 60}")
+                print(f"Sample {sample_idx + 1}:")
+                print(f"Target: {candidates[target_index][:60]}...")
+                print(f"Target score: {scores[target_index]:.4f}")
+                print(f"Target rank: {target_position + 1}/{len(candidates)}")
+                print(f"Top 3:")
+                for j in range(min(3, len(ranked_indices))):
+                    ridx = ranked_indices[j]
+                    print(f"  {j + 1}. score={scores[ridx]:.4f}: {candidates[ridx][:50]}...")
+
+            sample_idx += 1
 
     print(f"\nDebug results saved to: {debug_file}")
 
