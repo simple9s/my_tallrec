@@ -168,7 +168,7 @@ def preprocess_amazon_with_candidates(category='Luxury_Beauty', neg_ratio=19):
                 "instruction": f"This user has made a series of purchases in the following order: [{history_str}]. Based on this sequence of purchases, generate user representation token: [UserRep].",
                 "input": f"Given the {neg_ratio + 1} candidate items below, select which item the user will most likely purchase next:\n" + "\n".join(
                     [f'{i + 1}. Title: {title}' for i, title in enumerate(candidate_titles)]),
-                "output": candidate_titles[target_index],
+                "output": str(target_index + 1),
                 "candidates": candidate_titles,
                 "target_index": target_index
             })
