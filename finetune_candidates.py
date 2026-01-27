@@ -63,6 +63,8 @@ def train(
     tokenizer.add_special_tokens({'additional_special_tokens': ['[UserRep]', '[HistoryEmb]', '[CandidateEmb]']})
     model.resize_token_embeddings(len(tokenizer))
 
+    model = prepare_model_for_int8_training(model)
+
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
             prompt,
@@ -90,8 +92,6 @@ def train(
                     [-100] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
             )
         return tokenized_full_prompt
-
-    model = prepare_model_for_int8_training(model)
 
     config = LoraConfig(
         r=lora_r,
