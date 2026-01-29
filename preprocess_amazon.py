@@ -1,247 +1,286 @@
 import json
 import random
-import sys
-
-from tqdm import tqdm
-from collections import defaultdict
 import gzip
+from collections import defaultdict
+from tqdm import tqdm
+from datetime import datetime
+import os
 
 
-def load_amazon_data(rating_file, meta_file):
-    """加载Amazon 2018数据集"""
-    print("Loading ratings...")
-    ratings = []
-    with gzip.open(rating_file, 'r') as f:
+def load_amazon_data(file_path):
+    """加载Amazon评论数据"""
+    data = []
+    with gzip.open(file_path, 'rt', encoding='utf-8') as f:
         for line in f:
             try:
-                ratings.append(json.loads(line.strip()))
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(e)
+                data.append(json.loads(line.strip()))
+            except:
                 continue
 
-    print("Loading metadata...")
-    meta_data = {}
-    with gzip.open(meta_file, 'r') as f:
-        for line in f:
-            try:
-                item = json.loads(line.strip())
-                if 'asin' in item:
-                    meta_data[item['asin']] = item
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(e)
-                continue
-
-    return ratings, meta_data
+    import pandas as pd
+    return pd.DataFrame(data)
 
 
-def preprocess_amazon(rating_file, meta_file, output_prefix, min_interactions=10, seq_len=10):
-    """预处理Amazon数据集，生成1正19负的训练数据"""
-    ratings, meta_data = load_amazon_data(rating_file, meta_file)
+def filter_k_core(user_dict, item_counts, k=5):
+    """K-core过滤"""
+    while True:
+        new_user_dict = {}
+        for user, interactions in user_dict.items():
+            if len(interactions['asin']) >= k:
+                new_user_dict[user] = interactions
 
-    print("Building user interaction dictionary...")
-    interaction_dicts = defaultdict(lambda: {'asin': [], 'rating': [], 'timestamp': []})
+        new_item_counts = defaultdict(int)
+        for user, interactions in new_user_dict.items():
+            valid_items = []
+            valid_ratings = []
+            valid_times = []
+            valid_titles = []
 
-    for rating in tqdm(ratings):
-        user_id = rating['reviewerID']
-        asin = rating['asin']
-        rate = rating['overall']
-        timestamp = rating['unixReviewTime']
+            for i, item in enumerate(interactions['asin']):
+                if item_counts[item] >= k:
+                    valid_items.append(item)
+                    valid_ratings.append(interactions['rating'][i])
+                    valid_times.append(interactions['time'][i])
+                    valid_titles.append(interactions['title'][i])
+                    new_item_counts[item] += 1
 
-        interaction_dicts[user_id]['asin'].append(asin)
-        interaction_dicts[user_id]['rating'].append(int(rate >= 4))  # 4-5星为正样本
-        interaction_dicts[user_id]['timestamp'].append(timestamp)
+            if len(valid_items) >= k:
+                new_user_dict[user] = {
+                    'asin': valid_items,
+                    'rating': valid_ratings,
+                    'time': valid_times,
+                    'title': valid_titles
+                }
 
+        if len(new_user_dict) == len(user_dict):
+            break
+
+        user_dict = new_user_dict
+        item_counts = new_item_counts
+
+    return user_dict
+
+
+def preprocess_amazon(category='Luxury_Beauty', neg_per_pos=1):
+    """
+    预处理Amazon数据
+
+    Args:
+        category: 数据集类别
+        neg_per_pos: 每个正样本对应的负样本数量
+    """
+    print(f"Processing {category}...")
+
+    review_file = f'{category}.json.gz'
+    meta_file = f'meta_{category}.json.gz'
+
+    # 加载数据
+    reviews = load_amazon_data(review_file)
+    metadata = load_amazon_data(meta_file)
+
+    # 对Luxury_Beauty特殊处理
+    if category == 'Luxury_Beauty':
+        reviews = reviews[reviews['overall'] >= 3]
+
+    # 创建item映射
+    item_titles = {}
+    for _, row in metadata.iterrows():
+        if 'title' in row and row['title'] is not None:
+            item_titles[row['asin']] = str(row['title'])
+        else:
+            item_titles[row['asin']] = row['asin']
+
+    # 构建用户交互字典
+    user_dict = defaultdict(lambda: {'asin': [], 'rating': [], 'time': [], 'title': []})
+    item_counts = defaultdict(int)
+
+    for _, row in tqdm(reviews.iterrows(), desc="Processing reviews", total=len(reviews)):
+        if row['asin'] not in item_titles:
+            continue
+
+        user_id = row['reviewerID']
+        user_dict[user_id]['asin'].append(row['asin'])
+        user_dict[user_id]['rating'].append(int(row['overall'] > 3))
+        user_dict[user_id]['time'].append(row['unixReviewTime'])
+        user_dict[user_id]['title'].append(item_titles[row['asin']])
+        item_counts[row['asin']] += 1
+
+    # 过滤
+    min_interactions = 4 if category == 'Luxury_Beauty' else 5
     print(f"Filtering users with at least {min_interactions} interactions...")
-    filtered_users = {uid: data for uid, data in interaction_dicts.items()
-                      if len(data['asin']) >= min_interactions}
-    print(f"Filtered users: {len(filtered_users)}")
+    filtered_users = {k: v for k, v in user_dict.items() if len(v['asin']) >= min_interactions}
 
-    print("Creating item mapping...")
-    all_items = list(set([asin for user_data in filtered_users.values()
-                          for asin in user_data['asin']]))
-    item_to_idx = {asin: idx for idx, asin in enumerate(all_items)}
+    # 获取所有items
+    all_items = set()
+    for user_data in filtered_users.values():
+        all_items.update(user_data['asin'])
 
+    print(f"Total users: {len(filtered_users)}")
     print(f"Total items: {len(all_items)}")
 
-    # 保存物品映射，正确处理category字段
-    with open(f'{output_prefix}_item_mapping.json', 'w') as f:
-        item_mapping = []
-        for asin, idx in item_to_idx.items():
-            item_info = meta_data.get(asin, {})
+    # 创建序列数据
+    sequential_data = []
+    seq_len = 10
 
-            # 处理title
-            title = item_info.get('title', 'Unknown')
-            if isinstance(title, list):
-                title = ' '.join(title)
+    for user_id, interactions in tqdm(filtered_users.items(), desc="Creating sequences"):
+        # 按时间排序
+        indices = sorted(range(len(interactions['asin'])), key=lambda i: interactions['time'][i])
+        sorted_asin = [interactions['asin'][i] for i in indices]
+        sorted_rating = [interactions['rating'][i] for i in indices]
+        sorted_title = [interactions['title'][i] for i in indices]
+        sorted_time = [interactions['time'][i] for i in indices]
 
-            # 处理category - Amazon数据集中category可能有多种格式
-            category = item_info.get('category', [])
-            if not category:
-                category = item_info.get('categories', [])
+        # 为每个位置创建序列
+        for i in range(min(seq_len, len(sorted_asin) - 1), len(sorted_asin)):
+            user_history = set(sorted_asin[:i + 1])
+            neg_candidates = list(all_items - user_history)
 
-            # 如果category是嵌套列表，提取所有类别
-            flat_category = []
-            if isinstance(category, list):
-                for cat in category:
-                    if isinstance(cat, list):
-                        flat_category.extend(cat)
-                    else:
-                        flat_category.append(cat)
-
-            item_mapping.append({
-                'item_id': idx,
-                'asin': asin,
-                'title': title,
-                'category': flat_category
-            })
-        json.dump(item_mapping, f, indent=4)
-
-    print("Creating sequential interactions...")
-    sequential_interaction_list = []
-
-    for user_id, user_data in tqdm(filtered_users.items()):
-        # 按时间戳排序
-        temp = list(zip(user_data['asin'], user_data['rating'], user_data['timestamp']))
-        temp.sort(key=lambda x: x[2])
-        asins, ratings, timestamps = zip(*temp)
-
-        # 构建序列
-        for i in range(seq_len, len(asins)):
-            sequential_interaction_list.append({
+            sequential_data.append({
                 'user_id': user_id,
-                'history_asin': list(asins[i - seq_len:i]),
-                'history_rating': list(ratings[i - seq_len:i]),
-                'target_asin': asins[i],
-                'target_rating': ratings[i],
-                'timestamp': timestamps[i]
+                'history_asin': sorted_asin[max(0, i - seq_len):i],
+                'history_rating': sorted_rating[max(0, i - seq_len):i],
+                'history_title': sorted_title[max(0, i - seq_len):i],
+                'history_time': sorted_time[max(0, i - seq_len):i],
+                'target_asin': sorted_asin[i],
+                'target_rating': sorted_rating[i],
+                'target_title': sorted_title[i],
+                'neg_candidates': neg_candidates
             })
 
-    print(f"Total sequences: {len(sequential_interaction_list)}")
+    print(f"Total sequences: {len(sequential_data)}")
 
-    # 划分数据集：80% train, 10% valid, 10% test
-    random.seed(42)
-    random.shuffle(sequential_interaction_list)
+    # 划分数据集
+    random.shuffle(sequential_data)
+    train_size = int(len(sequential_data) * 0.8)
+    valid_size = int(len(sequential_data) * 0.9)
 
-    train_size = int(len(sequential_interaction_list) * 0.8)
-    valid_size = int(len(sequential_interaction_list) * 0.9)
+    train_data = sequential_data[:train_size]
+    valid_data = sequential_data[train_size:valid_size]
+    test_data = sequential_data[valid_size:]
 
-    train_data = sequential_interaction_list[:train_size]
-    valid_data = sequential_interaction_list[train_size:valid_size]
-    test_data = sequential_interaction_list[valid_size:]
+    print(f"Train: {len(train_data)}, Valid: {len(valid_data)}, Test: {len(test_data)}")
 
-    print(f"Train sequences: {len(train_data)}")
-    print(f"Valid sequences: {len(valid_data)}")
-    print(f"Test sequences: {len(test_data)}")
+    # 生成对比学习格式的数据
+    def create_contrastive_samples(data_list, output_path, neg_per_pos):
+        """
+        为每个序列生成对比样本
+        正样本：用户历史 + 目标item + label=1
+        负样本：用户历史 + 随机item + label=0
+        """
+        samples = []
 
-    def create_json_with_negatives(data, all_items, meta_data, item_to_idx, neg_ratio=19):
-        """为每个序列创建1正19负的样本"""
-        json_list = []
-
-        for seq in tqdm(data, desc="Creating samples"):
-            # 用户交互过的所有物品（历史+目标）
-            user_items = set(seq['history_asin'] + [seq['target_asin']])
-
-            # 负样本候选集：所有物品中排除用户交互过的
-            neg_candidates = [item for item in all_items if item not in user_items]
-
-            if len(neg_candidates) < neg_ratio:
-                print(f"Warning: Not enough negative candidates for user {seq['user_id']}")
+        for item in tqdm(data_list, desc=f"Generating {output_path}"):
+            # 只处理正样本（用户确实喜欢的）
+            if item['target_rating'] != 1:
                 continue
 
-            # 采样19个负样本
-            neg_samples = random.sample(neg_candidates, neg_ratio)
+            # 构建历史描述
+            history_items = []
+            for idx, (title, timestamp) in enumerate(zip(item['history_title'], item['history_time'])):
+                date_str = datetime.fromtimestamp(timestamp).strftime('%Y/%m/%d')
+                history_items.append(f"No.{idx + 1} Time: {date_str} Title: {title}")
 
-            # 构建偏好和非偏好字符串
-            preference = []
-            unpreference = []
-            for asin, rating in zip(seq['history_asin'], seq['history_rating']):
-                item_info = meta_data.get(asin, {})
-                title = item_info.get('title', 'Unknown Item')
-                if isinstance(title, list):
-                    title = ' '.join(title)
-
-                if rating == 1:
-                    preference.append(f'"{title}"')
-                else:
-                    unpreference.append(f'"{title}"')
-
-            preference_str = ", ".join(preference) if preference else "None"
-            unpreference_str = ", ".join(unpreference) if unpreference else "None"
+            history_str = ", ".join(history_items) if history_items else "None"
 
             # 正样本
-            target_info = meta_data.get(seq['target_asin'], {})
-            target_title = target_info.get('title', 'Unknown Item')
-            if isinstance(target_title, list):
-                target_title = ' '.join(target_title)
-
-            json_list.append({
-                "instruction": "Given the user's preference and unpreference, identify whether the user will like the target item by answering \"Yes.\" or \"No.\".",
-                "input": f"User Preference: {preference_str}\nUser Unpreference: {unpreference_str}\nWhether the user will like the target item \"{target_title}\"?",
-                "output": "Yes.",
-                "item_id": item_to_idx.get(seq['target_asin'], -1),
+            samples.append({
+                "history": history_str,
+                "candidate": item['target_title'],
                 "label": 1
             })
 
-            # 19个负样本
-            for neg_asin in neg_samples:
-                neg_info = meta_data.get(neg_asin, {})
-                neg_title = neg_info.get('title', 'Unknown Item')
-                if isinstance(neg_title, list):
-                    neg_title = ' '.join(neg_title)
-
-                json_list.append({
-                    "instruction": "Given the user's preference and unpreference, identify whether the user will like the target item by answering \"Yes.\" or \"No.\".",
-                    "input": f"User Preference: {preference_str}\nUser Unpreference: {unpreference_str}\nWhether the user will like the target item \"{neg_title}\"?",
-                    "output": "No.",
-                    "item_id": item_to_idx.get(neg_asin, -1),
+            # 负样本
+            random.shuffle(item['neg_candidates'])
+            for neg_asin in item['neg_candidates'][:neg_per_pos]:
+                neg_title = item_titles.get(neg_asin, neg_asin)
+                samples.append({
+                    "history": history_str,
+                    "candidate": neg_title,
                     "label": 0
                 })
 
-        return json_list
+        # 打乱顺序
+        random.shuffle(samples)
 
-    print("\nCreating training samples with negatives (1:19)...")
-    train_json = create_json_with_negatives(train_data, all_items, meta_data, item_to_idx, 19)
+        with open(output_path, 'w') as f:
+            json.dump(samples, f, indent=2)
 
-    print("Creating validation samples with negatives (1:19)...")
-    valid_json = create_json_with_negatives(valid_data, all_items, meta_data, item_to_idx, 19)
+        pos_count = sum(1 for s in samples if s['label'] == 1)
+        neg_count = sum(1 for s in samples if s['label'] == 0)
+        print(f"Saved {len(samples)} samples to {output_path}")
+        print(f"  Positive: {pos_count}, Negative: {neg_count}")
 
-    print("Creating test samples with negatives (1:19)...")
-    test_json = create_json_with_negatives(test_data, all_items, meta_data, item_to_idx, 19)
+    # 生成训练/验证/测试数据
+    os.makedirs('./data', exist_ok=True)
 
-    print("Saving files...")
-    with open(f'{output_prefix}_train.json', 'w') as f:
-        json.dump(train_json, f, indent=4)
+    # 训练和验证：对比学习格式（固定1:1负样本比例）
+    create_contrastive_samples(train_data, f'./data/train_{category.lower()}.json', neg_per_pos=1)
+    create_contrastive_samples(valid_data, f'./data/valid_{category.lower()}.json', neg_per_pos=1)
 
-    with open(f'{output_prefix}_valid.json', 'w') as f:
-        json.dump(valid_json, f, indent=4)
+    # 测试数据需要保留完整候选列表用于ranking
+    def create_test_samples(data_list, output_path, num_candidates):
+        """
+        测试数据格式：
+        {
+            "history": "...",
+            "candidates": ["item1", "item2", ...],
+            "target_index": 5
+        }
+        """
+        samples = []
 
-    with open(f'{output_prefix}_test.json', 'w') as f:
-        json.dump(test_json, f, indent=4)
+        for item in tqdm(data_list, desc=f"Generating {output_path}"):
+            if item['target_rating'] != 1:
+                continue
 
-    print(f"\nDataset statistics:")
-    print(
-        f"Train samples: {len(train_json)} (positive: {sum(1 for x in train_json if x['label'] == 1)}, negative: {sum(1 for x in train_json if x['label'] == 0)})")
-    print(
-        f"Valid samples: {len(valid_json)} (positive: {sum(1 for x in valid_json if x['label'] == 1)}, negative: {sum(1 for x in valid_json if x['label'] == 0)})")
-    print(
-        f"Test samples: {len(test_json)} (positive: {sum(1 for x in test_json if x['label'] == 1)}, negative: {sum(1 for x in test_json if x['label'] == 0)})")
-    print(f"Negative ratio: 1:19")
-    print(f"\nFiles saved:")
-    print(f"  - {output_prefix}_train.json")
-    print(f"  - {output_prefix}_valid.json")
-    print(f"  - {output_prefix}_test.json")
-    print(f"  - {output_prefix}_item_mapping.json")
+            history_items = []
+            for idx, (title, timestamp) in enumerate(zip(item['history_title'], item['history_time'])):
+                date_str = datetime.fromtimestamp(timestamp).strftime('%Y/%m/%d')
+                history_items.append(f"No.{idx + 1} Time: {date_str} Title: {title}")
+
+            history_str = ", ".join(history_items) if history_items else "None"
+
+            # 采样负样本
+            random.shuffle(item['neg_candidates'])
+            neg_samples = item['neg_candidates'][:num_candidates - 1]
+
+            # 组合候选并打乱
+            candidates_asin = [item['target_asin']] + neg_samples
+            random.shuffle(candidates_asin)
+            target_index = candidates_asin.index(item['target_asin'])
+
+            candidate_titles = [item_titles.get(asin, asin) for asin in candidates_asin]
+
+            samples.append({
+                "history": history_str,
+                "candidates": candidate_titles,
+                "target_index": target_index
+            })
+
+        with open(output_path, 'w') as f:
+            json.dump(samples, f, indent=2)
+
+        print(f"Saved {len(samples)} test samples to {output_path}")
+
+    # 生成不同候选数的测试数据
+    create_test_samples(test_data, f'./data/test_{category.lower()}_20.json', num_candidates=20)
+    create_test_samples(test_data, f'./data/test_{category.lower()}_100.json', num_candidates=100)
+
+    print(f"\nPreprocessing complete for {category}")
+
 
 if __name__ == "__main__":
-    # 修改这里的路径
-    base_path = "data/amazon_2018"
-    rating_file = f"data/amazon_2018/Luxury_Beauty.json.gz"  # Amazon评分文件路径
-    meta_file = "data/amazon_2018/meta_Luxury_Beauty.json.gz"  # Amazon元数据文件路径
-    output_prefix = "./data/amazon_beauty"  # 输出文件前缀
+    import argparse
 
-    preprocess_amazon(rating_file, meta_file, output_prefix,
-                      min_interactions=4, seq_len=10)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--category', type=str, default='Luxury_Beauty',
+                       choices=['Luxury_Beauty', 'Software', 'Video_Games'],
+                       help='Dataset category')
+    parser.add_argument('--neg_ratio', type=int, default=19,
+                       choices=[19, 99],
+                       help='Negative samples per positive (19 or 99)')
+
+    args = parser.parse_args()
+
+    # 处理数据集
+    preprocess_amazon(args.category, neg_per_pos=args.neg_ratio)

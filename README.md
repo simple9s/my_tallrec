@@ -1,46 +1,94 @@
-Our weights for the instruction tuning model is uploading [here](https://drive.google.com/file/d/1teUwLm4BOqhngfCKKXE1tiMhJPf_FvRJ/view?usp=sharing)
+# Amazon推荐系统 - 对比学习
 
-**TALLRec: An Effective and Efficient Tuning Framework to Align Large Language Model with Recommendation** is available at https://arxiv.org/abs/2305.00447.
+## 数据集
 
-**Wrongly delete the line in evaluate.py by mistake, now it has been updated**
+支持3个数据集，每个数据集生成20和100候选两种测试集：
+- `luxury_beauty` - Luxury Beauty
+- `software` - Software
+- `video_games` - Video Games
 
-We introduce a novel framework (TALLRec) that enables the efficient and effective adaptation of LLMs to recommendation tasks.
+## 使用
 
-# Main results
-|                                 |  |movie |  ||   book |  |
-|-------------------------------                  | ----- | ----- | ----- | ----- | ----- | ----- |
-| Few-shot                          | 16     | 64     | 256 | 16 | 64 | 256 |
-| GRU                             | 49.07 | 49.87 | 52.89 | 48.95 | 49.64 | 49.86 |
-| Caser                           | 49.68 | 51.06 | 54.20 | 49.84 | 49.72 | 49.57 |
-| SASRec                          | 50.43  | 50.48 | 52.25 | 49.48 | 50.06 | 50.20 |
-| DROS                            | 50.76    | 51.54  | 54.07 | 49.28 | 49.13 | 49.13 |
-| GRU-BERT                         | 50.85  | 51.65 | 53.44 | 50.07 | 49.64 | 49.79 |
-| DROS-BERT                         | 50.21  | 51.71 | 53.94 | 50.07 | 48.98 | 50.20 |
-| TALLRec (ours)               | **67.24** | **67.48** | **71.98** | **56.36** | **60.39** | **64.38** |
+### 1. 数据预处理
 
-Table 1. we shown the AUC results of the baseline models and our frameworks on movie and book scenarios.
+```bash
+# 下载Amazon数据（.json.gz文件）放到当前目录
 
-Train TALLRec base on LLaMA7B:
+# 处理Luxury Beauty - 生成20和100候选测试集
+python preprocess_amazon.py --category Luxury_Beauty --neg_ratio 19
+
+# 处理Software
+python preprocess_amazon.py --category Software --neg_ratio 19
+
+# 处理Video Games
+python preprocess_amazon.py --category Video_Games --neg_ratio 19
 ```
-bash ./shell/instruct_7B.sh  gpu_id random_seed
+
+生成文件：
 ```
-If you want to run it under your environment, you need to make changes to the sh file:
-- output_dir: Model save path，we will automatically add the seed and the sample to the end of the path for each experiments.
-- base_model: LLaMA parameter weight path in Hugginface format
-- train_data:  Training data path such as "./data/movie/train.json" for movie dataset.
-- val_data: Validation data set path such as "./data/movie/valid.json" for movie dataset.
-- instruction_model: The LoRA weights after the instruction tuning, for example lora weight from alpaca-lora.
-
-After training, you need to evluate the test result on the best model evaluated by the validation set.
+./data/train_luxury_beauty.json
+./data/valid_luxury_beauty.json  
+./data/test_luxury_beauty_20.json
+./data/test_luxury_beauty_100.json
 ```
-bash ./shell/evaluate.sh  gpu_id  output_dir
+
+### 2. 训练
+
+```bash
+# 格式：bash train.sh GPU_ID SEED BASE_MODEL DATASET
+bash train.sh 0 42 meta-llama/Llama-3.2-3B-Instruct luxury_beauty
 ```
-If you want to run it under your environment, you need to make changes to the sh file:
-- base_model: LLaMA parameter weight path in Hugginface format
-- test_data: Test data set path such as "./data/movie/test.json" for movie dataset.
 
-Note that we will automatically detect all the different seed and sample files in the output_dir directory, and then integrate these results into the output_dir.json file.
+### 3. 评估
 
-Our project is developed based on the Alpaca_lora [repo](https://github.com/tloen/alpaca-lora), thanks for their contributions.
+```bash
+# 格式：bash evaluate.sh GPU_ID BASE_MODEL LORA_WEIGHTS DATASET CANDIDATES
+# 20候选
+bash evaluate.sh 0 meta-llama/Llama-3.2-3B-Instruct ./output/luxury_beauty_seed42 luxury_beauty 20
 
-For "Environment setting sharing for CUDA 12.0", please see [here](https://github.com/SAI990323/TALLRec/issues/46).
+# 100候选
+bash evaluate.sh 0 meta-llama/Llama-3.2-3B-Instruct ./output/luxury_beauty_seed42 luxury_beauty 100
+```
+
+### 快速开始
+
+```bash
+# 一键运行（数据预处理+训练+评估20候选）
+bash quickstart.sh luxury_beauty 20
+
+# 100候选
+bash quickstart.sh luxury_beauty 100
+```
+
+## 结果
+
+结果保存在：
+- `./output/luxury_beauty_seed42/results_20.json` - 20候选指标
+- `./output/luxury_beauty_seed42/results_100.json` - 100候选指标
+- `./output/luxury_beauty_seed42/results_20_debug.json` - 详细结果
+
+## 指标
+
+- Hit@1, Hit@5, Hit@10, Hit@20
+- NDCG@1, NDCG@5, NDCG@10, NDCG@20
+
+预期（20候选）：
+- Hit@1: 0.35+
+- Hit@5: 0.65+
+- NDCG@5: 0.50+
+
+
+# 1. 预处理（生成20和100候选测试集）
+python preprocess_amazon.py --category Luxury_Beauty --neg_ratio 19
+
+# 2. 训练
+bash train.sh 0 42 meta-llama/Llama-3.2-3B-Instruct luxury_beauty
+
+# 3. 评估20候选
+bash evaluate.sh 0 meta-llama/Llama-3.2-3B-Instruct ./output/luxury_beauty_seed42 luxury_beauty 20
+
+# 4. 评估100候选
+bash evaluate.sh 0 meta-llama/Llama-3.2-3B-Instruct ./output/luxury_beauty_seed42 luxury_beauty 100
+
+# 或一键运行
+bash quickstart.sh luxury_beauty 20
