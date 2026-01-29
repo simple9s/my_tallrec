@@ -161,8 +161,17 @@ Based on the user representation [UserRep], will the user purchase this candidat
     val_data = load_dataset("json", data_files=val_data_path)
 
     # 处理数据
-    train_dataset = train_data["train"].shuffle(seed=seed).map(generate_and_tokenize_prompt)
-    val_dataset = val_data["train"].map(generate_and_tokenize_prompt)
+    train_dataset = train_data["train"] \
+        .shuffle(seed=seed) \
+        .map(
+        generate_and_tokenize_prompt,
+        remove_columns=train_data["train"].column_names
+    )
+
+    val_dataset = val_data["train"].map(
+        generate_and_tokenize_prompt,
+        remove_columns=val_data["train"].column_names
+    )
 
     if not ddp and torch.cuda.device_count() > 1:
         model.is_parallelizable = True
