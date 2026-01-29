@@ -30,6 +30,16 @@ fi
 
 mkdir -p $OUTPUT_DIR
 
+RESUME_ARG=""
+LAST_CHECKPOINT=$(ls -d ${OUTPUT_DIR}/checkpoint-* 2>/dev/null | sort -V | tail -n 1)
+
+if [ -n "$LAST_CHECKPOINT" ]; then
+    echo "Resuming from checkpoint: $LAST_CHECKPOINT"
+    RESUME_ARG="--resume_from_checkpoint $LAST_CHECKPOINT"
+else
+    echo "No checkpoint found, training from scratch"
+fi
+
 CUDA_VISIBLE_DEVICES=$GPU_ID python -u finetune.py \
     --base_model $BASE_MODEL \
     --train_data_path $TRAIN_DATA \
@@ -44,6 +54,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python -u finetune.py \
     --lora_r 8 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
-    --lora_target_modules '[q_proj,v_proj]'
+    --lora_target_modules '[q_proj,v_proj]' \
+    $RESUME_ARG
 
 echo "Training completed: $OUTPUT_DIR"

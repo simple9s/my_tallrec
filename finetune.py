@@ -32,6 +32,7 @@ def train(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     lora_target_modules: List[str] = ["q_proj", "v_proj"],
+    resume_from_checkpoint: str = None,
 ):
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
@@ -44,7 +45,10 @@ def train(
 ║ Seed:       {seed:<47}║
 ╚══════════════════════════════════════════════════════════════╝
     """)
-
+    if resume_from_checkpoint:
+        print(f"Resuming from checkpoint: {resume_from_checkpoint}")
+    else:
+        print("Training from scratch")
     assert base_model, "Please specify --base_model"
 
     # 计算梯度累积步数
@@ -193,10 +197,10 @@ Based on the user representation [UserRep], will the user purchase this candidat
             optim="adamw_torch",
             evaluation_strategy="steps",
             save_strategy="steps",
-            eval_steps=100,
-            save_steps=100,
+            eval_steps=500,
+            save_steps=500,
             output_dir=output_dir,
-            save_total_limit=3,
+            save_total_limit=2,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             ddp_find_unused_parameters=False if ddp else None,
@@ -214,7 +218,7 @@ Based on the user representation [UserRep], will the user purchase this candidat
 
     model.config.use_cache = False
 
-    if torch.__version__ >= "2" and sys.platform != "win32":
+    if torch.__version__ >= "2" and sys.platform != "win32" and not resume_from_checkpoint:
         model = torch.compile(model)
 
     # 开始训练
@@ -222,7 +226,7 @@ Based on the user representation [UserRep], will the user purchase this candidat
     print("Starting training...")
     print("="*60 + "\n")
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # 保存模型
     model.save_pretrained(output_dir)
